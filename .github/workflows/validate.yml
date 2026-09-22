@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the validated package to Hexium
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -16,15 +22,19 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "9.0.x"
       - name: Resolve package metadata
+        id: metadata
         run: |
           version=$(python3 -c 'import json; print(json.load(open("package/manifest.json"))["version_number"])')
           echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "PACKAGE_PATH=artifacts/LostKode-Valheim_Performance_Profiler-$version.zip" >> "$GITHUB_ENV"
       - name: Resolve build references
         shell: bash
@@ -54,3 +64,88 @@ jobs:
           name: LostKode-Valheim_Performance_Profiler-${{ env.PACKAGE_VERSION }}
           path: ${{ env.PACKAGE_PATH }}
           if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: hexium-production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: LostKode-Valheim_Performance_Profiler-${{ needs.validate.outputs.package_version }}
+          path: artifacts
+      - name: Publish package to Hexium
+        env:
+          HEXIUM_AUTH_TOKEN: ${{ secrets.HEXIUM_AUTH_TOKEN }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zipPath = "artifacts/LostKode-Valheim_Performance_Profiler-${{ needs.validate.outputs.package_version }}.zip"
+          $base = "https://hexium.gg/api/experimental"
+          $headers = @{ Authorization = "Bearer $env:HEXIUM_AUTH_TOKEN" }
+
+          if (-not $env:HEXIUM_AUTH_TOKEN) {
+            throw "HEXIUM_AUTH_TOKEN is required"
+          }
+
+          function Invoke-HexiumApi($Method, $Uri, $Body) {
+            try {
+              $json = $Body | ConvertTo-Json -Depth 10
+              return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ContentType "application/json" -Body $json
+            } catch {
+              $detail = $_.ErrorDetails.Message
+              $message = "Hexium API call to $Uri failed: $($_.Exception.Message)"
+              if ($detail) { $message = "$message`n$detail" }
+              throw $message
+            }
+          }
+
+          $fileBytes = [System.IO.File]::ReadAllBytes($zipPath)
+          $fileName = Split-Path $zipPath -Leaf
+          $initiate = Invoke-HexiumApi -Method Post -Uri "$base/usermedia/initiate-upload/" -Body @{
+            filename = $fileName
+            file_size_bytes = $fileBytes.Length
+          }
+
+          $uploadUuid = $initiate.user_media.uuid
+          if (-not $uploadUuid) {
+            throw "Hexium initiate-upload did not return a user_media.uuid"
+          }
+
+          $completedParts = @()
+          try {
+            foreach ($part in $initiate.upload_urls) {
+              $chunk = New-Object byte[] ([int]$part.length)
+              [Array]::Copy($fileBytes, [int]$part.offset, $chunk, 0, [int]$part.length)
+              $putResponse = Invoke-WebRequest -Method Put -Uri $part.url -Body $chunk -ContentType "application/octet-stream"
+              $etag = $putResponse.Headers['ETag']
+              if ($etag -is [array]) { $etag = $etag[0] }
+              if (-not $etag) { throw "Hexium upload part did not return an ETag" }
+              $completedParts += @{ ETag = $etag; PartNumber = $part.part_number }
+            }
+
+            Invoke-HexiumApi -Method Post -Uri "$base/usermedia/$uploadUuid/finish-upload/" -Body @{ parts = $completedParts } | Out-Null
+          } catch {
+            try {
+              Invoke-HexiumApi -Method Post -Uri "$base/usermedia/$uploadUuid/abort-upload/" -Body @{ uuid = $uploadUuid } | Out-Null
+            } catch {
+              Write-Warning "Hexium upload abort also failed"
+            }
+            throw
+          }
+
+          $result = Invoke-HexiumApi -Method Post -Uri "$base/submission/submit/" -Body @{
+            author_name = "LostKode"
+            categories = @()
+            communities = @("valheim")
+            has_nsfw_content = $false
+            upload_uuid = $uploadUuid
+            community_categories = @{
+              valheim = @("Client & Server", "Mods", "Open Source", "Valheim 1.0")
+            }
+          }
+
+          Write-Output "Hexium accepted LostKode-Valheim_Performance_Profiler-${{ needs.validate.outputs.package_version }}; hidden=$($result.hidden)"
