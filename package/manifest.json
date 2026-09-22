@@ -1,0 +1,10 @@
+{
+  "name": "Valheim_Performance_Profiler",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/LostKode/valheim-performance-profiler",
+  "description": "Low-overhead Valheim startup, joining, frame-time, memory, plugin, and Harmony diagnostics.",
+  "dependencies": [
+    "denikson-BepInExPack_Valheim-5.4.2350"
+  ]
+}
+
