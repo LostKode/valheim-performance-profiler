@@ -1,0 +1,56 @@
+name: Validate profiler package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: profiler-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - name: Resolve package metadata
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("package/manifest.json"))["version_number"])')
+          echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "PACKAGE_PATH=artifacts/LostKode-Valheim_Performance_Profiler-$version.zip" >> "$GITHUB_ENV"
+      - name: Resolve build references
+        shell: bash
+        run: |
+          install_root="$RUNNER_TEMP/valheim-build-references"
+          reference_version="1.2214.6"
+          reference_sha256="7b014ef8e605a251c6c3999f3c6a7e3ce1db59e7e0307733d4b80e3431893e86"
+          mkdir -p "$install_root"
+          curl --fail --location --retry 3 \
+            "https://api.nuget.org/v3-flatcontainer/coffeenova.valheim.managedreferences/$reference_version/coffeenova.valheim.managedreferences.$reference_version.nupkg" \
+            --output "$install_root/references.nupkg"
+          echo "$reference_sha256  $install_root/references.nupkg" | sha256sum --check --strict
+          unzip -q "$install_root/references.nupkg" -d "$install_root/package"
+          reference_dir="$install_root/package/lib/net46"
+          test -f "$reference_dir/UnityEngine.dll"
+          test -f "$reference_dir/BepInEx.dll"
+          echo "VALHEIM_MANAGED_DIR=$reference_dir" >> "$GITHUB_ENV"
+          echo "BEPINEX_CORE_DIR=$reference_dir" >> "$GITHUB_ENV"
+      - name: Build, test, and package
+        run: |
+          ./scripts/build.sh "$VALHEIM_MANAGED_DIR" "$BEPINEX_CORE_DIR"
+          ./scripts/test.sh
+          ./scripts/package.sh "$VALHEIM_MANAGED_DIR" "$BEPINEX_CORE_DIR"
+          python3 scripts/validate_package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LostKode-Valheim_Performance_Profiler-${{ env.PACKAGE_VERSION }}
+          path: ${{ env.PACKAGE_PATH }}
+          if-no-files-found: error
